@@ -77,11 +77,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private readonly List<VkBuffer> _availableStagingBuffers = new List<VkBuffer>();
 
     private readonly Dictionary<CommandBuffer, VkTexture> _submittedStagingTextures
-        = new Dictionary<CommandBuffer, VkTexture>();
+        = new Dictionary<CommandBuffer, VkTexture>(CommandBufferComparer.Instance);
     private readonly Dictionary<CommandBuffer, VkBuffer> _submittedStagingBuffers
-        = new Dictionary<CommandBuffer, VkBuffer>();
+        = new Dictionary<CommandBuffer, VkBuffer>(CommandBufferComparer.Instance);
     private readonly Dictionary<CommandBuffer, SharedCommandPool> _submittedSharedCommandPools
-        = new Dictionary<CommandBuffer, SharedCommandPool>();
+        = new Dictionary<CommandBuffer, SharedCommandPool>(CommandBufferComparer.Instance);
 
     public override string DeviceName => _deviceName;
 

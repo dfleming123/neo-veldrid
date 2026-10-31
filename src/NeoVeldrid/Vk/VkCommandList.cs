@@ -51,7 +51,7 @@ internal unsafe class VkCommandList : CommandList
 
     private StagingResourceInfo _currentStagingInfo;
     private readonly object _stagingLock = new object();
-    private readonly Dictionary<CommandBuffer, StagingResourceInfo> _submittedStagingInfos = new Dictionary<CommandBuffer, StagingResourceInfo>();
+    private readonly Dictionary<CommandBuffer, StagingResourceInfo> _submittedStagingInfos = new Dictionary<CommandBuffer, StagingResourceInfo>(CommandBufferComparer.Instance);
     private readonly List<StagingResourceInfo> _availableStagingInfos = new List<StagingResourceInfo>();
     private readonly List<VkBuffer> _availableStagingBuffers = new List<VkBuffer>();
 
@@ -748,7 +748,9 @@ internal unsafe class VkCommandList : CommandList
         if (index == 0 || _gd.Features.MultipleViewports)
         {
             Rect2D scissor = new Rect2D(new Offset2D((int)x, (int)y), new Extent2D((uint)width, (uint)height));
-            if (!scissor.Equals(_scissorRects[index]))
+            Rect2D previous = _scissorRects[index];
+            if (scissor.Offset.X != previous.Offset.X || scissor.Offset.Y != previous.Offset.Y
+                || scissor.Extent.Width != previous.Extent.Width || scissor.Extent.Height != previous.Extent.Height)
             {
                 _scissorRects[index] = scissor;
                 _gd.Vk.CmdSetScissor(_cb, index, 1, in scissor);
@@ -815,7 +817,7 @@ internal unsafe class VkCommandList : CommandList
 
         _gd.Vk.CmdCopyBuffer(_cb, srcVkBuffer.DeviceBuffer, dstVkBuffer.DeviceBuffer, 1, in region);
 
-        bool needToProtectUniform = destination.Usage.HasFlag(BufferUsage.UniformBuffer);
+        bool needToProtectUniform = (destination.Usage & BufferUsage.UniformBuffer) != 0;
 
         MemoryBarrier barrier = new MemoryBarrier
         {
