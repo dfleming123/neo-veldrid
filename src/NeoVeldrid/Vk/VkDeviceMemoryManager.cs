@@ -14,6 +14,10 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
     // chunk. Chunks are small and given back when empty, so what's reserved stays close to what's used (Wattle 0060).
     private const ulong MinDedicatedAllocationSizeDynamic = 1024 * 1024 * 1;
     private const ulong MinDedicatedAllocationSizeNonDynamic = 1024 * 1024 * 2;
+    // Past half the driver's limit on memory objects, the sizes before 0060: allocations under them share chunks of
+    // those sizes, so a scene of many mid-sized resources can't run the device out of allocations.
+    private const ulong CrowdedDedicatedAllocationSizeDynamic = 1024 * 1024 * 64;
+    private const ulong CrowdedDedicatedAllocationSizeNonDynamic = 1024 * 1024 * 256;
     private readonly Device _device;
     private readonly PhysicalDevice _physicalDevice;
     private readonly ulong _bufferImageGranularity;
@@ -25,6 +29,11 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     private readonly vkGetBufferMemoryRequirements2_t _getBufferMemoryRequirements2;
     private readonly vkGetImageMemoryRequirements2_t _getImageMemoryRequirements2;
+
+    // Device memory objects alive, own allocations and chunks, including those waiting to be freed; and the count past
+    // which allocations go back to the crowded sizes.
+    private int _memoryObjects;
+    private readonly int _crowdedMemoryObjects;
 
     // Submissions are numbered as they go to the queue, under the device's queue lock, and complete in order. Memory a
     // resource gives back is freed only once every submission made before the release has completed: a submission
@@ -50,6 +59,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         Device device,
         PhysicalDevice physicalDevice,
         ulong bufferImageGranularity,
+        uint maxMemoryAllocationCount,
         vkGetBufferMemoryRequirements2_t getBufferMemoryRequirements2,
         vkGetImageMemoryRequirements2_t getImageMemoryRequirements2)
     {
@@ -57,6 +67,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         _device = device;
         _physicalDevice = physicalDevice;
         _bufferImageGranularity = bufferImageGranularity;
+        _crowdedMemoryObjects = (int)Math.Clamp(maxMemoryAllocationCount / 2, 1u, (uint)int.MaxValue);
         _getBufferMemoryRequirements2 = getBufferMemoryRequirements2;
         _getImageMemoryRequirements2 = getImageMemoryRequirements2;
     }
@@ -106,6 +117,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
     private void FreeMemoryObject(DeviceMemory memory)
     {
         _vk.FreeMemory(_device, memory, null);
+        _memoryObjects--;
     }
 
     public VkMemoryBlock Allocate(
@@ -184,9 +196,10 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 throw new NeoVeldridException("No suitable memory type.");
             }
 
-            ulong minDedicatedAllocationSize = persistentMapped
-                ? MinDedicatedAllocationSizeDynamic
-                : MinDedicatedAllocationSizeNonDynamic;
+            bool crowded = _memoryObjects >= _crowdedMemoryObjects;
+            ulong minDedicatedAllocationSize = crowded
+                ? (persistentMapped ? CrowdedDedicatedAllocationSizeDynamic : CrowdedDedicatedAllocationSizeNonDynamic)
+                : (persistentMapped ? MinDedicatedAllocationSizeDynamic : MinDedicatedAllocationSizeNonDynamic);
 
             if (dedicated || size >= minDedicatedAllocationSize)
             {
@@ -227,12 +240,20 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                     }
                 }
 
+                _memoryObjects++;
                 return new VkMemoryBlock(memory, 0, size, memoryTypeBits, mappedPtr, true);
             }
             else
             {
                 ChunkAllocatorSet allocator = GetAllocator(memoryTypeIndex, persistentMapped);
-                bool result = allocator.Allocate(size, alignment, out VkMemoryBlock ret);
+                ulong chunkSize = crowded
+                    ? minDedicatedAllocationSize
+                    : 4 * minDedicatedAllocationSize;
+                bool result = allocator.Allocate(size, alignment, chunkSize, out VkMemoryBlock ret, out bool newChunk);
+                if (newChunk)
+                {
+                    _memoryObjects++;
+                }
                 if (!result)
                 {
                     throw new NeoVeldridException("Unable to allocate sufficient Vulkan memory.");
@@ -298,8 +319,10 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             _persistentMapped = persistentMapped;
         }
 
-        public bool Allocate(ulong size, ulong alignment, out VkMemoryBlock block)
+        /// <summary>First fit across the chunks, or a new chunk of this size, or the allocation's if larger.</summary>
+        public bool Allocate(ulong size, ulong alignment, ulong chunkSize, out VkMemoryBlock block, out bool newChunk)
         {
+            newChunk = false;
             foreach (ChunkAllocator allocator in _allocators)
             {
                 if (allocator.Allocate(size, alignment, out block))
@@ -308,8 +331,9 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 }
             }
 
-            ChunkAllocator newAllocator = new ChunkAllocator(_vk, _device, _memoryTypeIndex, _persistentMapped, size + alignment);
+            ChunkAllocator newAllocator = new ChunkAllocator(_vk, _device, _memoryTypeIndex, _persistentMapped, Math.Max(chunkSize, size + alignment));
             _allocators.Add(newAllocator);
+            newChunk = true;
             return newAllocator.Allocate(size, alignment, out block);
         }
 
@@ -364,9 +388,6 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     private class ChunkAllocator : IDisposable
     {
-        // Four times the size that gets an allocation of its own, so a chunk always holds several blocks.
-        private const ulong PersistentMappedChunkSize = MinDedicatedAllocationSizeDynamic * 4;
-        private const ulong UnmappedChunkSize = MinDedicatedAllocationSizeNonDynamic * 4;
         private readonly Silk.NET.Vulkan.Vk _vk;
         private readonly Device _device;
         private readonly uint _memoryTypeIndex;
@@ -385,13 +406,14 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         /// <summary>Whether no block is allocated from this chunk.</summary>
         public bool IsEmpty => _liveBlocks == 0;
 
-        public ChunkAllocator(Silk.NET.Vulkan.Vk vk, Device device, uint memoryTypeIndex, bool persistentMapped, ulong minimumSize)
+        /// <summary>A chunk of this size, which <see cref="VkDeviceMemoryManager.Allocate(PhysicalDeviceMemoryProperties, uint, MemoryPropertyFlags, bool, ulong, ulong, bool, Image, VkBufferHandle)"/> chooses.</summary>
+        public ChunkAllocator(Silk.NET.Vulkan.Vk vk, Device device, uint memoryTypeIndex, bool persistentMapped, ulong size)
         {
             _vk = vk;
             _device = device;
             _memoryTypeIndex = memoryTypeIndex;
             _persistentMapped = persistentMapped;
-            _totalMemorySize = Math.Max(persistentMapped ? PersistentMappedChunkSize : UnmappedChunkSize, minimumSize);
+            _totalMemorySize = size;
 
             MemoryAllocateInfo memoryAI = new MemoryAllocateInfo
             {

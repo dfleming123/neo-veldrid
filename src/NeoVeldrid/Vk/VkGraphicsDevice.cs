@@ -158,6 +158,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             _device,
             _physicalDevice,
             _physicalDeviceProperties.Limits.BufferImageGranularity,
+            _physicalDeviceProperties.Limits.MaxMemoryAllocationCount,
             _getBufferMemoryRequirements2,
             _getImageMemoryRequirements2);
 
