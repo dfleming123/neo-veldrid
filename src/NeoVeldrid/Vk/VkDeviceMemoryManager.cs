@@ -421,8 +421,12 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             };
             memoryAI.AllocationSize = _totalMemorySize;
             memoryAI.MemoryTypeIndex = _memoryTypeIndex;
+            // CheckResult only throws in Debug builds, so these throw themselves: a chunk must never join its set without memory.
             Result result = _vk.AllocateMemory(_device, in memoryAI, null, out _memory);
-            CheckResult(result);
+            if (result != Result.Success)
+            {
+                throw new NeoVeldridException("Unable to allocate sufficient Vulkan memory: " + result);
+            }
 
             void* mappedPtr = null;
             if (persistentMapped)
@@ -431,7 +435,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 if (result != Result.Success)
                 {
                     _vk.FreeMemory(_device, _memory, null);
-                    CheckResult(result);
+                    throw new NeoVeldridException("Unable to map newly-allocated Vulkan memory: " + result);
                 }
             }
             _mappedPtr = mappedPtr;
