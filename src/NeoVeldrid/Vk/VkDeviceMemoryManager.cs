@@ -155,6 +155,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                     Result mapResult = _vk.MapMemory(_device, memory, 0, size, 0, &mappedPtr);
                     if (mapResult != Result.Success)
                     {
+                        _vk.FreeMemory(_device, memory, null);
                         throw new NeoVeldridException("Unable to map newly-allocated Vulkan memory.");
                     }
                 }
@@ -334,7 +335,11 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             if (persistentMapped)
             {
                 result = _vk.MapMemory(_device, _memory, 0, _totalMemorySize, 0, &mappedPtr);
-                CheckResult(result);
+                if (result != Result.Success)
+                {
+                    _vk.FreeMemory(_device, _memory, null);
+                    CheckResult(result);
+                }
             }
             _mappedPtr = mappedPtr;
 
