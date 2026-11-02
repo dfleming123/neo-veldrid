@@ -9,8 +9,10 @@ namespace NeoVeldrid.Vk;
 
 internal unsafe class VkDeviceMemoryManager : IDisposable
 {
-    private const ulong MinDedicatedAllocationSizeDynamic = 1024 * 1024 * 64;
-    private const ulong MinDedicatedAllocationSizeNonDynamic = 1024 * 1024 * 256;
+    // An allocation of a quarter of a chunk or more gets device memory of its own, freed with it. Below that it shares a
+    // chunk. Chunks are small and given back when empty, so what's reserved stays close to what's used (Wattle 0060).
+    private const ulong MinDedicatedAllocationSizeDynamic = 1024 * 1024 * 1;
+    private const ulong MinDedicatedAllocationSizeNonDynamic = 1024 * 1024 * 2;
     private readonly Device _device;
     private readonly PhysicalDevice _physicalDevice;
     private readonly ulong _bufferImageGranularity;
@@ -238,20 +240,45 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 }
             }
 
-            ChunkAllocator newAllocator = new ChunkAllocator(_vk, _device, _memoryTypeIndex, _persistentMapped);
+            ChunkAllocator newAllocator = new ChunkAllocator(_vk, _device, _memoryTypeIndex, _persistentMapped, size + alignment);
             _allocators.Add(newAllocator);
             return newAllocator.Allocate(size, alignment, out block);
         }
 
+        /// <summary>
+        /// Returns a block to its chunk. A chunk left empty is given back, unless no other chunk of this set is empty:
+        /// one empty chunk is kept, so short-lived staging buffers don't allocate and free a chunk on every upload.
+        /// </summary>
         public void Free(VkMemoryBlock block)
         {
-            foreach (ChunkAllocator chunk in _allocators)
+            for (int i = 0; i < _allocators.Count; i++)
             {
-                if (chunk.Memory.Handle == block.DeviceMemory.Handle)
+                ChunkAllocator chunk = _allocators[i];
+                if (chunk.Memory.Handle != block.DeviceMemory.Handle)
                 {
-                    chunk.Free(block);
+                    continue;
+                }
+
+                chunk.Free(block);
+                if (chunk.IsEmpty && HasEmptyChunkOtherThan(chunk))
+                {
+                    _allocators.RemoveAt(i);
+                    chunk.Dispose();
+                }
+                return;
+            }
+        }
+
+        private bool HasEmptyChunkOtherThan(ChunkAllocator chunk)
+        {
+            foreach (ChunkAllocator other in _allocators)
+            {
+                if (other != chunk && other.IsEmpty)
+                {
+                    return true;
                 }
             }
+            return false;
         }
 
         public void Dispose()
@@ -265,28 +292,34 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     private class ChunkAllocator : IDisposable
     {
-        private const ulong PersistentMappedChunkSize = 1024 * 1024 * 64;
-        private const ulong UnmappedChunkSize = 1024 * 1024 * 256;
+        // Four times the size that gets an allocation of its own, so a chunk always holds several blocks.
+        private const ulong PersistentMappedChunkSize = MinDedicatedAllocationSizeDynamic * 4;
+        private const ulong UnmappedChunkSize = MinDedicatedAllocationSizeNonDynamic * 4;
         private readonly Silk.NET.Vulkan.Vk _vk;
         private readonly Device _device;
         private readonly uint _memoryTypeIndex;
         private readonly bool _persistentMapped;
+        // Free ranges, by offset, never touching: neighbours merge when a block is freed.
         private readonly List<VkMemoryBlock> _freeBlocks = new List<VkMemoryBlock>();
         private readonly DeviceMemory _memory;
         private readonly void* _mappedPtr;
 
         private ulong _totalMemorySize;
         private ulong _totalAllocatedBytes = 0;
+        private int _liveBlocks;
 
         public DeviceMemory Memory => _memory;
 
-        public ChunkAllocator(Silk.NET.Vulkan.Vk vk, Device device, uint memoryTypeIndex, bool persistentMapped)
+        /// <summary>Whether no block is allocated from this chunk.</summary>
+        public bool IsEmpty => _liveBlocks == 0;
+
+        public ChunkAllocator(Silk.NET.Vulkan.Vk vk, Device device, uint memoryTypeIndex, bool persistentMapped, ulong minimumSize)
         {
             _vk = vk;
             _device = device;
             _memoryTypeIndex = memoryTypeIndex;
             _persistentMapped = persistentMapped;
-            _totalMemorySize = persistentMapped ? PersistentMappedChunkSize : UnmappedChunkSize;
+            _totalMemorySize = Math.Max(persistentMapped ? PersistentMappedChunkSize : UnmappedChunkSize, minimumSize);
 
             MemoryAllocateInfo memoryAI = new MemoryAllocateInfo
             {
@@ -315,56 +348,48 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             _freeBlocks.Add(initialBlock);
         }
 
+        /// <summary>
+        /// First fit. Padding before an aligned start stays on the free list, so a chunk whose blocks are all freed is one
+        /// free range again.
+        /// </summary>
         public bool Allocate(ulong size, ulong alignment, out VkMemoryBlock block)
         {
             checked
             {
+                if (alignment == 0)
+                {
+                    alignment = 1;
+                }
+
                 for (int i = 0; i < _freeBlocks.Count; i++)
                 {
                     VkMemoryBlock freeBlock = _freeBlocks[i];
-                    ulong alignedBlockSize = freeBlock.Size;
-                    if (freeBlock.Offset % alignment != 0)
+                    ulong start = (freeBlock.Offset + alignment - 1) / alignment * alignment;
+                    ulong padding = start - freeBlock.Offset;
+                    if (padding >= freeBlock.Size || freeBlock.Size - padding < size)
                     {
-                        ulong alignmentCorrection = (alignment - freeBlock.Offset % alignment);
-                        if (alignedBlockSize <= alignmentCorrection)
-                        {
-                            continue;
-                        }
-                        alignedBlockSize -= alignmentCorrection;
+                        continue;
                     }
 
-                    if (alignedBlockSize >= size) // Valid match -- split it and return.
+                    ulong after = freeBlock.Size - padding - size;
+                    _freeBlocks.RemoveAt(i);
+                    int at = i;
+                    if (padding > 0)
                     {
-                        _freeBlocks.RemoveAt(i);
+                        _freeBlocks.Insert(at++, new VkMemoryBlock(_memory, freeBlock.Offset, padding, _memoryTypeIndex, _mappedPtr, false));
+                    }
+                    if (after > 0)
+                    {
+                        _freeBlocks.Insert(at, new VkMemoryBlock(_memory, start + size, after, _memoryTypeIndex, _mappedPtr, false));
+                    }
 
-                        freeBlock.Size = alignedBlockSize;
-                        if ((freeBlock.Offset % alignment) != 0)
-                        {
-                            freeBlock.Offset += alignment - (freeBlock.Offset % alignment);
-                        }
-
-                        block = freeBlock;
-
-                        if (alignedBlockSize != size)
-                        {
-                            VkMemoryBlock splitBlock = new VkMemoryBlock(
-                                freeBlock.DeviceMemory,
-                                freeBlock.Offset + size,
-                                freeBlock.Size - size,
-                                _memoryTypeIndex,
-                                freeBlock.BaseMappedPointer,
-                                false);
-                            _freeBlocks.Insert(i, splitBlock);
-                            block = freeBlock;
-                            block.Size = size;
-                        }
-
+                    block = new VkMemoryBlock(_memory, start, size, _memoryTypeIndex, _mappedPtr, false);
 #if DEBUG
-                        CheckAllocatedBlock(block);
+                    CheckAllocatedBlock(block);
 #endif
-                        _totalAllocatedBytes += alignedBlockSize;
-                        return true;
-                    }
+                    _totalAllocatedBytes += size;
+                    _liveBlocks++;
+                    return true;
                 }
 
                 block = default(VkMemoryBlock);
@@ -372,55 +397,36 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             }
         }
 
+        /// <summary>Returns a block to the free list, merged with the free ranges either side of it.</summary>
         public void Free(VkMemoryBlock block)
         {
-            for (int i = 0; i < _freeBlocks.Count; i++)
+            int i = 0;
+            while (i < _freeBlocks.Count && _freeBlocks[i].Offset < block.Offset)
             {
-                if (_freeBlocks[i].Offset > block.Offset)
-                {
-                    _freeBlocks.Insert(i, block);
-                    MergeContiguousBlocks();
-#if DEBUG
-                    RemoveAllocatedBlock(block);
-#endif
-                    return;
-                }
+                i++;
             }
 
-            _freeBlocks.Add(block);
+            ulong start = block.Offset;
+            ulong end = block.End;
+            if (i < _freeBlocks.Count && _freeBlocks[i].Offset == end)
+            {
+                end = _freeBlocks[i].End;
+                _freeBlocks.RemoveAt(i);
+            }
+            if (i > 0 && _freeBlocks[i - 1].End == start)
+            {
+                start = _freeBlocks[i - 1].Offset;
+                _freeBlocks.RemoveAt(i - 1);
+                i--;
+            }
+            _freeBlocks.Insert(i, new VkMemoryBlock(_memory, start, end - start, _memoryTypeIndex, _mappedPtr, false));
+
 #if DEBUG
             RemoveAllocatedBlock(block);
 #endif
             _totalAllocatedBytes -= block.Size;
-        }
-
-        private void MergeContiguousBlocks()
-        {
-            int contiguousLength = 1;
-            for (int i = 0; i < _freeBlocks.Count - 1; i++)
-            {
-                ulong blockStart = _freeBlocks[i].Offset;
-                while (i + contiguousLength < _freeBlocks.Count
-                    && _freeBlocks[i + contiguousLength - 1].End == _freeBlocks[i + contiguousLength].Offset)
-                {
-                    contiguousLength += 1;
-                }
-
-                if (contiguousLength > 1)
-                {
-                    ulong blockEnd = _freeBlocks[i + contiguousLength - 1].End;
-                    _freeBlocks.RemoveRange(i, contiguousLength);
-                    VkMemoryBlock mergedBlock = new VkMemoryBlock(
-                        Memory,
-                        blockStart,
-                        blockEnd - blockStart,
-                        _memoryTypeIndex,
-                        _mappedPtr,
-                        false);
-                    _freeBlocks.Insert(i, mergedBlock);
-                    contiguousLength = 0;
-                }
-            }
+            _liveBlocks--;
+            Debug.Assert(_liveBlocks > 0 || (_freeBlocks.Count == 1 && _freeBlocks[0].Size == _totalMemorySize), "An empty chunk isn't one free range.");
         }
 
 #if DEBUG
