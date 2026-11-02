@@ -377,13 +377,19 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             return false;
         }
 
-        public void Dispose()
+        /// <summary>Frees every chunk and returns how many there were.</summary>
+        public int DisposeChunks()
         {
             foreach (ChunkAllocator allocator in _allocators)
             {
                 allocator.Dispose();
             }
+            int count = _allocators.Count;
+            _allocators.Clear();
+            return count;
         }
+
+        public void Dispose() => DisposeChunks();
     }
 
     private class ChunkAllocator : IDisposable
@@ -580,14 +586,17 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             _pendingReleases.Clear();
         }
 
-        foreach (KeyValuePair<uint, ChunkAllocatorSet> kvp in _allocatorsByMemoryType)
+        lock (_lock)
         {
-            kvp.Value.Dispose();
-        }
+            foreach (KeyValuePair<uint, ChunkAllocatorSet> kvp in _allocatorsByMemoryType)
+            {
+                _memoryObjects -= kvp.Value.DisposeChunks();
+            }
 
-        foreach (KeyValuePair<uint, ChunkAllocatorSet> kvp in _allocatorsByMemoryTypeUnmapped)
-        {
-            kvp.Value.Dispose();
+            foreach (KeyValuePair<uint, ChunkAllocatorSet> kvp in _allocatorsByMemoryTypeUnmapped)
+            {
+                _memoryObjects -= kvp.Value.DisposeChunks();
+            }
         }
     }
 
