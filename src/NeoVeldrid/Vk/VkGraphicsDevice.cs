@@ -260,8 +260,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             submissionFence = vkFence;
         }
 
+        ulong serial;
         lock (_graphicsQueueLock)
         {
+            // Numbered before it's submitted, so memory released from now on waits for it.
+            serial = _memoryManager.NextSubmissionSerial();
             Result result = _vk.QueueSubmit(_graphicsQueue, 1, &si, vkFence);
             CheckResult(result);
             FlushValidationErrors();
@@ -274,12 +277,13 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
         lock (_submittedFencesLock)
         {
-            _submittedFences.Add(new FenceSubmissionInfo(submissionFence, vkCL, vkCB));
+            _submittedFences.Add(new FenceSubmissionInfo(submissionFence, vkCL, vkCB, serial));
         }
     }
 
     private void CheckSubmittedFences()
     {
+        ulong completedSerial = 0;
         lock (_submittedFencesLock)
         {
             for (int i = 0; i < _submittedFences.Count; i++)
@@ -288,6 +292,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 if (_vk.GetFenceStatus(_device, fsi.Fence) == Result.Success)
                 {
                     CompleteFenceSubmission(fsi);
+                    completedSerial = Math.Max(completedSerial, fsi.Serial);
                     _submittedFences.RemoveAt(i);
                     i -= 1;
                 }
@@ -296,6 +301,12 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                     break; // Submissions are in order; later submissions cannot complete if this one hasn't.
                 }
             }
+        }
+
+        // Outside the fences lock: memory waiting for these submissions can go now.
+        if (completedSerial != 0)
+        {
+            _memoryManager.SubmissionsCompleted(completedSerial);
         }
     }
 
@@ -1149,12 +1160,16 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     private protected override void WaitForIdleCore()
     {
+        ulong idleSerial;
         lock (_graphicsQueueLock)
         {
             _vk.QueueWaitIdle(_graphicsQueue);
+            // Under the queue lock, nothing was submitted after the wait began, so every submission up to here is done.
+            idleSerial = _memoryManager.LastSubmissionSerial;
         }
 
         CheckSubmittedFences();
+        _memoryManager.SubmissionsCompleted(idleSerial);
         FlushValidationErrors();
     }
 
@@ -1644,11 +1659,13 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         public VkFenceHandle Fence;
         public VkCommandList CommandList;
         public CommandBuffer CommandBuffer;
-        public FenceSubmissionInfo(VkFenceHandle fence, VkCommandList commandList, CommandBuffer commandBuffer)
+        public ulong Serial;
+        public FenceSubmissionInfo(VkFenceHandle fence, VkCommandList commandList, CommandBuffer commandBuffer, ulong serial)
         {
             Fence = fence;
             CommandList = commandList;
             CommandBuffer = commandBuffer;
+            Serial = serial;
         }
     }
 }

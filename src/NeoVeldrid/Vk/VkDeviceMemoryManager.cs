@@ -3,6 +3,7 @@ using static NeoVeldrid.Vk.VulkanUtil;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System;
+using System.Threading;
 using VkBufferHandle = Silk.NET.Vulkan.Buffer;
 
 namespace NeoVeldrid.Vk;
@@ -25,6 +26,25 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
     private readonly vkGetBufferMemoryRequirements2_t _getBufferMemoryRequirements2;
     private readonly vkGetImageMemoryRequirements2_t _getImageMemoryRequirements2;
 
+    // Submissions are numbered as they go to the queue, under the device's queue lock, and complete in order. Memory a
+    // resource gives back is freed only once every submission made before the release has completed: a submission
+    // needn't hold a reference to everything it uses (an UpdateBuffer destination, attachments, views' textures).
+    private ulong _submittedSerial;
+    private ulong _completedSerial;
+    private readonly List<PendingRelease> _pendingReleases = new List<PendingRelease>();
+
+    private readonly struct PendingRelease
+    {
+        public readonly DeviceMemory Memory;
+        public readonly ulong Serial;
+
+        public PendingRelease(DeviceMemory memory, ulong serial)
+        {
+            Memory = memory;
+            Serial = serial;
+        }
+    }
+
     public VkDeviceMemoryManager(
         Silk.NET.Vulkan.Vk vk,
         Device device,
@@ -39,6 +59,53 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         _bufferImageGranularity = bufferImageGranularity;
         _getBufferMemoryRequirements2 = getBufferMemoryRequirements2;
         _getImageMemoryRequirements2 = getImageMemoryRequirements2;
+    }
+
+    /// <summary>Numbers a submission. Called under the device's queue lock, just before it submits.</summary>
+    internal ulong NextSubmissionSerial() => Interlocked.Increment(ref _submittedSerial);
+
+    /// <summary>The number of the last submission made. Read under the device's queue lock, it's exact.</summary>
+    internal ulong LastSubmissionSerial => Interlocked.Read(ref _submittedSerial);
+
+    /// <summary>Every submission up to this number has completed: frees the memory that was waiting for them.</summary>
+    internal void SubmissionsCompleted(ulong serial)
+    {
+        lock (_lock)
+        {
+            if (serial > _completedSerial)
+            {
+                _completedSerial = serial;
+            }
+
+            for (int i = 0; i < _pendingReleases.Count; i++)
+            {
+                if (_pendingReleases[i].Serial <= _completedSerial)
+                {
+                    FreeMemoryObject(_pendingReleases[i].Memory);
+                    _pendingReleases.RemoveAt(i);
+                    i--;
+                }
+            }
+        }
+    }
+
+    /// <summary>Gives a memory object back now if nothing submitted before it may still use it, and otherwise once that's done. Under <see cref="_lock"/>.</summary>
+    private void Release(DeviceMemory memory)
+    {
+        ulong serial = Interlocked.Read(ref _submittedSerial);
+        if (serial <= _completedSerial)
+        {
+            FreeMemoryObject(memory);
+        }
+        else
+        {
+            _pendingReleases.Add(new PendingRelease(memory, serial));
+        }
+    }
+
+    private void FreeMemoryObject(DeviceMemory memory)
+    {
+        _vk.FreeMemory(_device, memory, null);
     }
 
     public VkMemoryBlock Allocate(
@@ -183,11 +250,11 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         {
             if (block.DedicatedAllocation)
             {
-                _vk.FreeMemory(_device, block.DeviceMemory, null);
+                Release(block.DeviceMemory);
             }
-            else
+            else if (GetAllocator(block.MemoryTypeIndex, block.IsPersistentMapped).Free(block, out DeviceMemory emptied))
             {
-                GetAllocator(block.MemoryTypeIndex, block.IsPersistentMapped).Free(block);
+                Release(emptied);
             }
         }
     }
@@ -247,11 +314,13 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
         }
 
         /// <summary>
-        /// Returns a block to its chunk. A chunk left empty is given back, unless no other chunk of this set is empty:
-        /// one empty chunk is kept, so short-lived staging buffers don't allocate and free a chunk on every upload.
+        /// Returns a block to its chunk. A chunk left empty leaves the set at once, so nothing more is placed in it, and
+        /// its memory is handed back to be freed, unless no other chunk of this set is empty: one empty chunk is kept, so
+        /// short-lived staging buffers don't allocate and free a chunk on every upload.
         /// </summary>
-        public void Free(VkMemoryBlock block)
+        public bool Free(VkMemoryBlock block, out DeviceMemory emptied)
         {
+            emptied = default;
             for (int i = 0; i < _allocators.Count; i++)
             {
                 ChunkAllocator chunk = _allocators[i];
@@ -264,10 +333,12 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 if (chunk.IsEmpty && HasEmptyChunkOtherThan(chunk))
                 {
                     _allocators.RemoveAt(i);
-                    chunk.Dispose();
+                    emptied = chunk.Memory;
+                    return true;
                 }
-                return;
+                return false;
             }
+            return false;
         }
 
         private bool HasEmptyChunkOtherThan(ChunkAllocator chunk)
@@ -474,6 +545,15 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     public void Dispose()
     {
+        lock (_lock)
+        {
+            foreach (PendingRelease pending in _pendingReleases)
+            {
+                FreeMemoryObject(pending.Memory);
+            }
+            _pendingReleases.Clear();
+        }
+
         foreach (KeyValuePair<uint, ChunkAllocatorSet> kvp in _allocatorsByMemoryType)
         {
             kvp.Value.Dispose();
