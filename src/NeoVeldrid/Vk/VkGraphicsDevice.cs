@@ -1467,7 +1467,13 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         VkFenceHandle vkFence = Util.AssertSubtype<Fence, NeoVeldrid.Vk.VkFence>(fence).DeviceFence;
         Result result = _vk.WaitForFences(_device, 1, &vkFence, true, nanosecondTimeout);
-        return result == Result.Success;
+        if (result == Result.Success)
+        {
+            // Work the wait saw finish completes here, so what it held (memory released since) goes now, not at the next submit.
+            CheckSubmittedFences();
+            return true;
+        }
+        return false;
     }
 
     public override bool WaitForFences(Fence[] fences, bool waitAll, ulong nanosecondTimeout)
@@ -1480,7 +1486,12 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
 
         Result result = _vk.WaitForFences(_device, (uint)fenceCount, fencesPtr, waitAll, nanosecondTimeout);
-        return result == Result.Success;
+        if (result == Result.Success)
+        {
+            CheckSubmittedFences();
+            return true;
+        }
+        return false;
     }
 
     internal static bool IsSupported()
