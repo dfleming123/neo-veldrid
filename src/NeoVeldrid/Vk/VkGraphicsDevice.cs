@@ -82,6 +82,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         = new Dictionary<CommandBuffer, VkBuffer>(CommandBufferComparer.Instance);
     private readonly Dictionary<CommandBuffer, SharedCommandPool> _submittedSharedCommandPools
         = new Dictionary<CommandBuffer, SharedCommandPool>(CommandBufferComparer.Instance);
+    // The destination of an UpdateBuffer or UpdateTexture copy, held until its command buffer completes, so a Dispose
+    // straight after the update can't destroy the buffer or image, or free its memory, while the copy still writes it.
+    private readonly Dictionary<CommandBuffer, ResourceRefCount> _submittedUpdateDestinations
+        = new Dictionary<CommandBuffer, ResourceRefCount>(CommandBufferComparer.Instance);
 
     public override string DeviceName => _deviceName;
 
@@ -325,6 +329,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             {
                 _submittedStagingTextures.Remove(completedCB);
                 _availableStagingTextures.Add(stagingTex);
+            }
+            if (_submittedUpdateDestinations.Remove(completedCB, out ResourceRefCount destination))
+            {
+                destination.Decrement();
             }
             if (_submittedStagingBuffers.TryGetValue(completedCB, out VkBuffer stagingBuffer))
             {
@@ -1137,6 +1145,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
 
         Debug.Assert(_submittedStagingBuffers.Count == 0);
+        Debug.Assert(_submittedUpdateDestinations.Count == 0);
         foreach (VkBuffer buffer in _availableStagingBuffers)
         {
             buffer.Dispose();
@@ -1297,9 +1306,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             };
             _vk.CmdCopyBuffer(cb, copySrcVkBuffer.DeviceBuffer, vkBuffer.DeviceBuffer, 1, in copyRegion);
 
+            vkBuffer.RefCount.Increment();
             lock (_stagingResourcesLock)
             {
                 _submittedStagingBuffers.Add(cb, copySrcVkBuffer);
+                _submittedUpdateDestinations.Add(cb, vkBuffer.RefCount);
             }
             pool.EndAndSubmit(cb);
         }
@@ -1389,9 +1400,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 stagingTex, 0, 0, 0, 0, 0,
                 texture, x, y, z, mipLevel, arrayLayer,
                 width, height, depth, 1);
+            vkTex.RefCount.Increment();
             lock (_stagingResourcesLock)
             {
                 _submittedStagingTextures.Add(cb, stagingTex);
+                _submittedUpdateDestinations.Add(cb, vkTex.RefCount);
             }
             pool.EndAndSubmit(cb);
         }
